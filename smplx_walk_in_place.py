@@ -40,7 +40,8 @@ import numpy as np
 import torch
 import open3d as o3d
 import smplx
-
+import numpy as np
+import torch
 
 # ------------------------- OBJ export -------------------------
 def export_obj(path: str, v: np.ndarray, f: np.ndarray):
@@ -104,84 +105,129 @@ def set_joint_z(body_pose, j, angle_rad):
 
 
 # ------------------------- Procedural walk cycle -------------------------
+
+# --- helpers: add axis-angle around single axis (safe to layer) ---
+def add_joint_x(body_pose, j, a):
+    body_pose[0, 3*j + 0] += a
+
+def add_joint_y(body_pose, j, a):
+    body_pose[0, 3*j + 1] += a
+
+def add_joint_z(body_pose, j, a):
+    body_pose[0, 3*j + 2] += a
+
+
 def walk_pose(
     t: float,
-    freq_hz: float = 1.2,
-    hip_swing: float = 0.55,     # radians
-    knee_lift: float = 0.95,     # radians
-    ankle_comp: float = 0.40,    # radians
-    arm_swing: float = 0.55,     # radians
-    elbow_bend: float = 0.35,    # radians
-    torso_bob: float = 0.015,    # meters
+    # slower cadence => walking (not running)
+    freq_hz: float = 0.85,         # 0.7~1.0 looks like walk; 1.2+ looks like jog/run
+    # leg amplitudes (smaller => slower/softer walk)
+    hip_swing: float = 0.35,       # rad
+    knee_lift: float = 0.55,       # rad
+    ankle_comp: float = 0.35,      # rad
+    # arm swing (smaller than legs)
+    #arm_swing: float = 0.35,       # rad
+    arm_swing: float = 0.45,       # rad
+    #elbow_bend: float = 0.30,      # rad
+    elbow_bend: float = 0.40,      # rad
+    # "arms down" offsets (key to avoid T-pose look)
+    shoulder_adduct: float = 0.95, # rad (brings arms down at sides)
+    shoulder_twist: float = 0.10,  # rad (tiny forward roll)
+    # body bob
+    torso_bob: float = 0.012,      # meters
     device: str = "cpu",
 ):
     """
-    Returns:
-      global_orient: (1,3) axis-angle
-      body_pose:    (1,63)
-      transl:       (1,3)  (walk in place: mostly bob)
+    Walk-in-place pose generator.
+    - Adds a constant shoulder adduction so arms are down.
+    - Adds arm swing opposite to legs.
+    - Slower cadence + smaller amplitudes => walking, not running.
     """
-    # phase
     w = 2.0 * np.pi * freq_hz
     phase = w * t
 
-    # left/right are out of phase by pi
+    # left and right legs out of phase by pi
     sL = np.sin(phase)
     sR = np.sin(phase + np.pi)
 
-    # Use cos for "stance/swing" shaping
-    cL = np.cos(phase)
-    cR = np.cos(phase + np.pi)
+    # shape for stance/swing
+    # swing gate: 0..1 (more bend when leg is in forward swing)
+    swingL = np.clip((sL + 1.0) * 0.5, 0.0, 1.0)
+    swingR = np.clip((sR + 1.0) * 0.5, 0.0, 1.0)
 
     body_pose = torch.zeros((1, 63), dtype=torch.float32, device=device)
 
-    # --- Lower body: hips, knees, ankles ---
-    # Hips: swing forward/back (X axis)
-    set_joint_x(body_pose, JOINT["L_HIP"],  hip_swing * sL)
-    set_joint_x(body_pose, JOINT["R_HIP"],  hip_swing * sR)
+    # ---------------- legs ----------------
+    # hips: forward/back
+    add_joint_x(body_pose, JOINT["L_HIP"], hip_swing * sL)
+    add_joint_x(body_pose, JOINT["R_HIP"], hip_swing * sR)
 
-    # Knees: bend mostly during "swing" (when leg moves forward)
-    # We shape it so bending happens more when hip is forward.
-    kneeL = knee_lift * np.clip((sL + 1.0) / 2.0, 0.0, 1.0) ** 1.6
-    kneeR = knee_lift * np.clip((sR + 1.0) / 2.0, 0.0, 1.0) ** 1.6
-    set_joint_x(body_pose, JOINT["L_KNEE"], kneeL)
-    set_joint_x(body_pose, JOINT["R_KNEE"], kneeR)
+    # knees: bend mainly during swing
+    kneeL = knee_lift * (swingL ** 1.8)
+    kneeR = knee_lift * (swingR ** 1.8)
+    add_joint_x(body_pose, JOINT["L_KNEE"], kneeL)
+    add_joint_x(body_pose, JOINT["R_KNEE"], kneeR)
 
-    # Ankles: compensate knee/hip to keep foot more level-ish (rough)
-    set_joint_x(body_pose, JOINT["L_ANKLE"], -ankle_comp * kneeL)
-    set_joint_x(body_pose, JOINT["R_ANKLE"], -ankle_comp * kneeR)
+    # ankles: compensate
+    add_joint_x(body_pose, JOINT["L_ANKLE"], -ankle_comp * kneeL)
+    add_joint_x(body_pose, JOINT["R_ANKLE"], -ankle_comp * kneeR)
 
-    # Feet: slight toe-off during push phase (cos-based)
-    toeL = 0.25 * np.clip((cL + 1.0) / 2.0, 0.0, 1.0) ** 1.8
-    toeR = 0.25 * np.clip((cR + 1.0) / 2.0, 0.0, 1.0) ** 1.8
-    set_joint_x(body_pose, JOINT["L_FOOT"], toeL)
-    set_joint_x(body_pose, JOINT["R_FOOT"], toeR)
+    # slight toe-off near end of stance (cos-shaped)
+    cL = np.cos(phase)
+    cR = np.cos(phase + np.pi)
+    toeL = 0.18 * np.clip((cL + 1.0) * 0.5, 0.0, 1.0) ** 2.2
+    toeR = 0.18 * np.clip((cR + 1.0) * 0.5, 0.0, 1.0) ** 2.2
+    add_joint_x(body_pose, JOINT["L_FOOT"], toeL)
+    add_joint_x(body_pose, JOINT["R_FOOT"], toeR)
 
-    # --- Upper body: arms swing opposite to legs ---
-    # Shoulders: swing opposite to corresponding hip
-    set_joint_x(body_pose, JOINT["L_SHOULDER"], -arm_swing * sR)
-    set_joint_x(body_pose, JOINT["R_SHOULDER"], -arm_swing * sL)
+    # ---------------- arms ----------------
+    # Goal:
+    # - arms rest down (not T-pose)
+    # - swing around the vertical line by about +/-10 degrees (Z axis)
+    # - avoid strong forward/back swing (X axis)
 
-    # Elbows: keep some bend; modulate slightly with swing
-    set_joint_x(body_pose, JOINT["L_ELBOW"],  elbow_bend + 0.15 * np.clip((sR + 1.0) / 2.0, 0.0, 1.0))
-    set_joint_x(body_pose, JOINT["R_ELBOW"],  elbow_bend + 0.15 * np.clip((sL + 1.0) / 2.0, 0.0, 1.0))
+    deg = np.pi / 180.0
 
-    # Wrists: tiny counter motion
-    set_joint_x(body_pose, JOINT["L_WRIST"], -0.10 * sR)
-    set_joint_x(body_pose, JOINT["R_WRIST"], -0.10 * sL)
+    # constant arms-down offset (adduction): adjust if arms still too lifted
+    # (bigger -> arms closer to body)
+    #base_adduct = 55.0 * deg   # ~55 deg
+    base_adduct = 65.0 * deg   # ~55 deg
+    
+    add_joint_z(body_pose, JOINT["L_SHOULDER"], -base_adduct)
+    add_joint_z(body_pose, JOINT["R_SHOULDER"], +base_adduct)
 
-    # Spine/torso: slight counter-rotation for realism
-    add_joint_x(body_pose, JOINT["SPINE1"],  0.08 * np.sin(phase + np.pi/2))
-    add_joint_x(body_pose, JOINT["SPINE2"],  0.05 * np.sin(phase + np.pi/2))
-    add_joint_x(body_pose, JOINT["SPINE3"],  0.03 * np.sin(phase + np.pi/2))
+    # small swing around vertical line: +/-10 deg
+    # use opposite phase to legs: left arm ~ right leg
+    swing_amp = 10.0 * deg     # +/-10 deg
+    add_joint_z(body_pose, JOINT["L_SHOULDER"], +(swing_amp * np.sin(phase + np.pi)))
+    add_joint_z(body_pose, JOINT["R_SHOULDER"], -(swing_amp * np.sin(phase)))
 
-    # Global orientation: slight forward lean
+    # tiny forward roll so it doesn't look like a rigid hinge (optional)
+    add_joint_x(body_pose, JOINT["L_SHOULDER"], 0.06)
+    add_joint_x(body_pose, JOINT["R_SHOULDER"], 0.06)
+
+    # elbows: keep slight bend, tiny modulation
+    add_joint_x(body_pose, JOINT["L_ELBOW"], elbow_bend + 0.06 * (swingR ** 1.5))
+    add_joint_x(body_pose, JOINT["R_ELBOW"], elbow_bend + 0.06 * (swingL ** 1.5))
+
+    # wrists: very small counter swing (optional)
+    add_joint_z(body_pose, JOINT["L_WRIST"], -0.04 * np.sin(phase + np.pi))
+    add_joint_z(body_pose, JOINT["R_WRIST"], +0.04 * np.sin(phase)
+)
+
+    # ---------------- torso / head ----------------
+    # subtle torso counter motion (small!)
+    add_joint_x(body_pose, JOINT["SPINE1"], 0.05 * np.sin(phase + np.pi/2))
+    add_joint_x(body_pose, JOINT["SPINE2"], 0.03 * np.sin(phase + np.pi/2))
+    add_joint_y(body_pose, JOINT["SPINE1"], 0.03 * np.sin(phase))  # tiny yaw
+
+    # global: small forward lean
     global_orient = torch.zeros((1, 3), dtype=torch.float32, device=device)
-    global_orient[0, 0] = 0.10  # lean forward
+    global_orient[0, 0] = 0.08
 
-    # Translation: walk-in-place bobbing (up/down only)
+    # translation: bob up/down only (walk in place)
     transl = torch.zeros((1, 3), dtype=torch.float32, device=device)
-    transl[0, 1] = torso_bob * (0.5 + 0.5 * np.sin(2.0 * phase))  # 2x frequency bob
+    transl[0, 1] = torso_bob * (0.5 + 0.5 * np.sin(2.0 * phase))
 
     return global_orient, body_pose, transl
 
