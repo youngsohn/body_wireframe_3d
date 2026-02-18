@@ -1,3 +1,35 @@
+"""
+how to run:
+
+source ~/codes/venv-smplx311/bin/activate
+
+# 1) FAST: export body frames WITHOUT opening Open3D viewer
+# 2) run Blender cloth sim
+# 3) visualize body + cloth
+
+python3 smplx_clothes.py \
+  --smpl_model_folder ./smpl_models \
+  --gender neutral \
+  --device cpu \
+  --seconds 6 --fps 30 --freq_hz 1.0 \
+  --export_dir out/walk_frames \
+  --cloth_obj assets/shirt.obj \
+  --cloth_out out/cloth_frames \
+  --blender "$(which blender)" \
+  --run_cloth_sim \
+  --no_view_export
+
+
+If you only want to visualize body+cloth and cloth is already baked:
+python3 smplx_clothes.py \
+  --smpl_model_folder ./smpl_models \
+  --gender neutral \
+  --device cpu \
+  --seconds 6 --fps 30 --freq_hz 1.0 \
+  --cloth_out out/cloth_frames \
+  --view_cloth_only
+"""
+
 import os
 import time
 import json
@@ -8,6 +40,10 @@ import torch
 import open3d as o3d
 import smplx
 
+
+def log(msg: str):
+    print(msg, flush=True)
+
 # ------------------------- OBJ export -------------------------
 def export_obj(path: str, v: np.ndarray, f: np.ndarray):
     with open(path, "w") as fp:
@@ -15,6 +51,7 @@ def export_obj(path: str, v: np.ndarray, f: np.ndarray):
             fp.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
         for a, b, c in (f.astype(np.int64) + 1):
             fp.write(f"f {a} {b} {c}\n")
+
 
 # ------------------------- Joint mapping (SMPL body 21 joints) -------------------------
 JOINT = {
@@ -25,10 +62,12 @@ JOINT = {
     "L_WRIST": 19, "R_WRIST": 20,
 }
 
+
 # --- helpers: add axis-angle around single axis (safe to layer) ---
 def add_joint_x(body_pose, j, a): body_pose[0, 3*j + 0] += a
 def add_joint_y(body_pose, j, a): body_pose[0, 3*j + 1] += a
 def add_joint_z(body_pose, j, a): body_pose[0, 3*j + 2] += a
+
 
 # ------------------------- Procedural walk cycle -------------------------
 def walk_pose(
@@ -39,8 +78,6 @@ def walk_pose(
     ankle_comp: float = 0.35,
     arm_swing: float = 0.45,
     elbow_bend: float = 0.40,
-    shoulder_adduct: float = 0.95,
-    shoulder_twist: float = 0.10,
     torso_bob: float = 0.012,
     device: str = "cpu",
 ):
@@ -67,6 +104,7 @@ def walk_pose(
     add_joint_x(body_pose, JOINT["L_ANKLE"], -ankle_comp * kneeL)
     add_joint_x(body_pose, JOINT["R_ANKLE"], -ankle_comp * kneeR)
 
+    # toe-off
     cL = np.cos(phase)
     cR = np.cos(phase + np.pi)
     toeL = 0.18 * np.clip((cL + 1.0) * 0.5, 0.0, 1.0) ** 2.2
@@ -94,7 +132,7 @@ def walk_pose(
     add_joint_z(body_pose, JOINT["L_WRIST"], -0.04 * np.sin(phase + np.pi))
     add_joint_z(body_pose, JOINT["R_WRIST"], +0.04 * np.sin(phase))
 
-    # torso/head
+    # torso/head tiny motion
     add_joint_x(body_pose, JOINT["SPINE1"], 0.05 * np.sin(phase + np.pi/2))
     add_joint_x(body_pose, JOINT["SPINE2"], 0.03 * np.sin(phase + np.pi/2))
     add_joint_y(body_pose, JOINT["SPINE1"], 0.03 * np.sin(phase))
@@ -107,49 +145,11 @@ def walk_pose(
 
     return global_orient, body_pose, transl
 
-# ------------------------- Attachment export (head transform) -------------------------
-def make_head_transform(joints_np: np.ndarray):
-    """
-    Build a simple rigid transform for head-attached objects.
-    We approximate head orientation using (NECK->HEAD) as 'up' and (L_COLLAR->R_COLLAR) as 'right'.
-    Returns 4x4 transform matrix in world coordinates.
-    """
-    neck = joints_np[JOINT["NECK"]]
-    head = joints_np[JOINT["HEAD"]]
-    lcol = joints_np[JOINT["L_COLLAR"]]
-    rcol = joints_np[JOINT["R_COLLAR"]]
-
-    up = head - neck
-    up_norm = np.linalg.norm(up) + 1e-8
-    up = up / up_norm
-
-    right = rcol - lcol
-    right_norm = np.linalg.norm(right) + 1e-8
-    right = right / right_norm
-
-    forward = np.cross(right, up)
-    f_norm = np.linalg.norm(forward) + 1e-8
-    forward = forward / f_norm
-
-    # re-orthogonalize right
-    right = np.cross(up, forward)
-    right = right / (np.linalg.norm(right) + 1e-8)
-
-    R = np.stack([right, up, forward], axis=1)  # columns
-    T = np.eye(4, dtype=np.float32)
-    T[:3, :3] = R.astype(np.float32)
-    T[:3, 3] = head.astype(np.float32)          # origin at HEAD joint
-    return T
 
 # ------------------------- Blender cloth sim script generator -------------------------
 def write_blender_script(path: str):
     """
-    Writes a Blender Python script which:
-    - Imports body OBJ sequence (frame_00000.obj...)
-    - Imports a single cloth OBJ (rest mesh)
-    - Adds cloth sim + collision
-    - Bakes and exports cloth OBJ sequence
-
+    Writes a Blender Python script.
     IMPORTANT FIX:
       Blender's sys.argv includes its own flags. We must parse only args after '--'.
     """
@@ -161,12 +161,26 @@ import sys
 def clear_scene():
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
-    for block in bpy.data.meshes:
-        bpy.data.meshes.remove(block)
+    # purge meshes to avoid memory build-up
+    for block in list(bpy.data.meshes):
+        try:
+            bpy.data.meshes.remove(block)
+        except:
+            pass
 
 def import_obj(filepath):
+    # Resolve relative paths relative to this .py script location
+    if not os.path.isabs(filepath):
+        base = os.path.dirname(os.path.abspath(__file__))
+        filepath = os.path.join(base, filepath)
+    filepath = os.path.abspath(filepath)
+
+    if not os.path.exists(filepath):
+        raise RuntimeError(f"OBJ Import: file does not exist: {filepath}")
+
     bpy.ops.wm.obj_import(filepath=filepath)
     return bpy.context.selected_objects[0]
+
 
 def export_obj(obj, filepath):
     bpy.ops.object.select_all(action='DESELECT')
@@ -182,20 +196,35 @@ def set_frame_range(start, end):
     bpy.context.scene.frame_end = int(end)
 
 def add_collision(obj, thickness=0.003):
-    bpy.context.view_layer.objects.active = obj
-    if obj.collision is None:
-        bpy.ops.object.modifier_add(type='COLLISION')
-    obj.collision.thickness_outer = thickness
+    if obj is None or obj.type != 'MESH':
+        return
 
-def add_cloth(obj, quality=8, time_scale=1.0, pressure=0.0):
+    # ensure editable
+    obj.hide_set(False)
+    obj.hide_viewport = False
+    obj.hide_render = False
+
+    # ensure modifier exists
+    if not any(m.type == 'COLLISION' for m in obj.modifiers):
+        obj.modifiers.new(name="Collision", type='COLLISION')
+
+    col = obj.collision
+    if col is None:
+        return
+
+    col.thickness_outer = float(thickness)
+    col.thickness_inner = 0.0
+    col.damping = 0.1
+    col.friction_factor = 0.5
+        
+
+def add_cloth(obj, quality=10):
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.modifier_add(type='CLOTH')
     m = obj.modifiers[-1]
     st = m.settings
+
     st.quality = int(quality)
-    st.time_scale = float(time_scale)
-    st.use_pressure = (pressure != 0.0)
-    st.uniform_pressure_force = float(pressure)
 
     # collisions
     st.use_collision = True
@@ -203,36 +232,37 @@ def add_cloth(obj, quality=8, time_scale=1.0, pressure=0.0):
     st.distance_min = 0.003
     st.use_self_collision = True
     st.self_distance_min = 0.002
-
     return m
 
 def make_body_sequence(body_dir, n_frames):
-    # import first body
-    body0 = import_obj(os.path.join(body_dir, "frame_00000.obj"))
-    body0.name = "Body"
+    bodies = []
+    for f in range(n_frames):
+        path = os.path.join(body_dir, f"frame_{f:05d}.obj")
+        obj = import_obj(path)
+        obj.name = f"Body_{f:05d}"
+        bodies.append(obj)
 
-    # animate by swapping mesh each frame (fast and simple)
+    # add collision first (before any hide)
+    for obj in bodies:
+        add_collision(obj, thickness=0.003)
+
+    # then animate visibility
     for f in range(n_frames):
         bpy.context.scene.frame_set(f + 1)
-        path = os.path.join(body_dir, f"frame_{f:05d}.obj")
+        for k, obj in enumerate(bodies):
+            visible = (k == f)
+            obj.hide_viewport = not visible
+            obj.hide_render = not visible
+            obj.keyframe_insert(data_path="hide_viewport", frame=f + 1)
+            obj.keyframe_insert(data_path="hide_render", frame=f + 1)
 
-        # import temp
-        tmp = import_obj(path)
-        tmp.data.name = f"BodyMesh_{f:05d}"
+    return bodies
 
-        # keyframe body mesh datablock switch
-        body0.data = tmp.data
-        body0.keyframe_insert(data_path="data", frame=f + 1)
 
-        # delete tmp object but keep mesh datablock (linked)
-        bpy.data.objects.remove(tmp, do_unlink=True)
-
-    return body0
 
 def bake_and_export(cloth_obj, out_dir, n_frames):
     os.makedirs(out_dir, exist_ok=True)
 
-    # ensure cloth modifier exists
     cloth_mod = None
     for mod in cloth_obj.modifiers:
         if mod.type == 'CLOTH':
@@ -244,10 +274,10 @@ def bake_and_export(cloth_obj, out_dir, n_frames):
     cache = cloth_mod.point_cache
     cache.frame_start = 1
     cache.frame_end = n_frames
+
     bpy.ops.ptcache.free_bake_all()
     bpy.ops.ptcache.bake_all(bake=True)
 
-    # export per frame
     for f in range(n_frames):
         bpy.context.scene.frame_set(f + 1)
         export_obj(cloth_obj, os.path.join(out_dir, f"cloth_{f:05d}.obj"))
@@ -262,27 +292,24 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--n_frames", type=int, required=True)
 
-    # -------- FIX: parse only arguments after '--' --------
     argv = sys.argv
     if "--" in argv:
         argv = argv[argv.index("--") + 1:]
     else:
         argv = []
     args = ap.parse_args(argv)
-    # -----------------------------------------------------
 
     clear_scene()
     set_scene_fps(args.fps)
     set_frame_range(1, args.n_frames)
 
-    body = make_body_sequence(args.body_dir, args.n_frames)
-    add_collision(body, thickness=0.003)
+    bodies = make_body_sequence(args.body_dir, args.n_frames)
 
     cloth = import_obj(args.cloth_obj)
     cloth.name = "Cloth"
-    add_cloth(cloth, quality=10, time_scale=1.0, pressure=0.0)
+    add_cloth(cloth, quality=10)
 
-    # Put cloth slightly away from body to reduce initial intersections
+    # small offset to reduce initial intersections
     cloth.location.z += 0.002
 
     bake_and_export(cloth, args.out_dir, args.n_frames)
@@ -293,128 +320,16 @@ if __name__ == "__main__":
     with open(path, "w") as f:
         f.write(script)
 
-# ------------------------- Open3D animation (body only OR body+cloth) -------------------------
-def animate_walk_open3d(
-    model,
-    betas,
-    seconds=6.0,
-    fps=30,
-    freq_hz=1.2,
-    export_dir="",
-    device="cpu",
-    cloth_dir="",
-    hair_obj="",
-    attach_json="",
-):
-    os.makedirs(export_dir, exist_ok=True) if export_dir else None
 
-    faces = model.faces.astype(np.int32)
+def run_blender_cloth(blender_bin: str, blender_script: str, body_dir: str, cloth_obj: str,
+                      out_dir: str, fps: int, n_frames: int):
 
-    # initial body
-    g0, p0, tr0 = walk_pose(0.0, freq_hz=freq_hz, device=device)
-    out0 = model(betas=betas, global_orient=g0, body_pose=p0, transl=tr0, return_verts=True)
-    verts0 = out0.vertices[0].detach().cpu().numpy()
+    blender_bin = os.path.abspath(blender_bin)
+    blender_script = os.path.abspath(blender_script)
+    body_dir = os.path.abspath(body_dir)
+    cloth_obj = os.path.abspath(cloth_obj)
+    out_dir = os.path.abspath(out_dir)
 
-    body_mesh = o3d.geometry.TriangleMesh()
-    body_mesh.vertices = o3d.utility.Vector3dVector(verts0.astype(np.float64))
-    body_mesh.triangles = o3d.utility.Vector3iVector(faces)
-    body_mesh.compute_vertex_normals()
-
-    # optional cloth display (load cloth objs per frame)
-    cloth_mesh = None
-    if cloth_dir and os.path.isdir(cloth_dir):
-        # load first cloth
-        cpath0 = os.path.join(cloth_dir, "cloth_00000.obj")
-        if os.path.exists(cpath0):
-            cloth_mesh = o3d.io.read_triangle_mesh(cpath0)
-            cloth_mesh.compute_vertex_normals()
-
-    # optional hair rigid attachment
-    hair_mesh = None
-    if hair_obj and os.path.exists(hair_obj):
-        hair_mesh = o3d.io.read_triangle_mesh(hair_obj)
-        hair_mesh.compute_vertex_normals()
-
-    # Open3D window
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="SMPL-X walk (+cloth)", width=1200, height=900)
-    vis.add_geometry(body_mesh)
-    if cloth_mesh is not None:
-        vis.add_geometry(cloth_mesh)
-    if hair_mesh is not None:
-        vis.add_geometry(hair_mesh)
-
-    ctr = vis.get_view_control()
-    ctr.set_zoom(0.7)
-
-    dt = 1.0 / fps
-    total_frames = int(seconds * fps)
-
-    # attachment records (head transform per frame)
-    attach = {"head_T_4x4": []} if attach_json else None
-
-    for i in range(total_frames):
-        t = i * dt
-        g, p, tr = walk_pose(t, freq_hz=freq_hz, device=device)
-
-        out = model(betas=betas, global_orient=g, body_pose=p, transl=tr, return_verts=True)
-        verts = out.vertices[0].detach().cpu().numpy()
-
-        body_mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
-        body_mesh.compute_vertex_normals()
-
-        # joints for head attachment
-        joints = out.joints[0].detach().cpu().numpy()
-        head_T = make_head_transform(joints)
-
-        if attach is not None:
-            attach["head_T_4x4"].append(head_T.tolist())
-
-        # update cloth mesh if present
-        if cloth_mesh is not None:
-            cpath = os.path.join(cloth_dir, f"cloth_{i:05d}.obj")
-            if os.path.exists(cpath):
-                new_cloth = o3d.io.read_triangle_mesh(cpath)
-                new_cloth.compute_vertex_normals()
-                # replace geometry data (Open3D doesn't like swapping object references)
-                cloth_mesh.vertices = new_cloth.vertices
-                cloth_mesh.triangles = new_cloth.triangles
-                cloth_mesh.vertex_normals = new_cloth.vertex_normals
-
-        # update hair rigid transform
-        if hair_mesh is not None:
-            # reset each frame: easiest is to store original hair and retransform
-            # Here we assume hair_obj is modeled near origin (head-local). If it's already world-positioned, skip.
-            # We'll apply head_T to hair vertices.
-            # NOTE: For performance, pre-load vertices once and transform in-place. Kept simple here.
-            base_hair = o3d.io.read_triangle_mesh(hair_obj)
-            V = np.asarray(base_hair.vertices)
-            Vh = (head_T[:3, :3] @ V.T).T + head_T[:3, 3]
-            hair_mesh.vertices = o3d.utility.Vector3dVector(Vh.astype(np.float64))
-            hair_mesh.triangles = base_hair.triangles
-            hair_mesh.compute_vertex_normals()
-
-        vis.update_geometry(body_mesh)
-        if cloth_mesh is not None:
-            vis.update_geometry(cloth_mesh)
-        if hair_mesh is not None:
-            vis.update_geometry(hair_mesh)
-
-        vis.poll_events()
-        vis.update_renderer()
-
-        if export_dir:
-            export_obj(os.path.join(export_dir, f"frame_{i:05d}.obj"), verts, faces)
-
-        time.sleep(dt)
-
-    vis.destroy_window()
-
-    if attach is not None:
-        with open(attach_json, "w") as f:
-            json.dump(attach, f, indent=2)
-
-def run_blender_cloth(blender_bin: str, blender_script: str, body_dir: str, cloth_obj: str, out_dir: str, fps: int, n_frames: int):
     cmd = [
         blender_bin,
         "--background",
@@ -429,6 +344,8 @@ def run_blender_cloth(blender_bin: str, blender_script: str, body_dir: str, clot
     print("Running Blender cloth sim:\n", " ".join(cmd))
     subprocess.check_call(cmd)
 
+
+
 def parse_betas(s: str, n: int, device: str):
     betas = torch.zeros((1, n), dtype=torch.float32, device=device)
     if s.strip():
@@ -439,6 +356,90 @@ def parse_betas(s: str, n: int, device: str):
         vals = vals[:n]
         betas[:] = torch.tensor(vals, dtype=torch.float32, device=device).reshape(1, -1)
     return betas
+
+
+# ------------------------- FAST export body frames (no Open3D window) -------------------------
+@torch.no_grad()
+def export_body_sequence(model, betas, seconds, fps, freq_hz, export_dir, device):
+    os.makedirs(export_dir, exist_ok=True)
+    faces = model.faces.astype(np.int32)
+
+    dt = 1.0 / fps
+    total_frames = int(seconds * fps)
+
+    for i in range(total_frames):
+        t = i * dt
+        g, p, tr = walk_pose(t, freq_hz=freq_hz, device=device)
+        out = model(betas=betas, global_orient=g, body_pose=p, transl=tr, return_verts=True)
+        verts = out.vertices[0].detach().cpu().numpy()
+        export_obj(os.path.join(export_dir, f"frame_{i:05d}.obj"), verts, faces)
+
+    print(f"[OK] Exported body OBJ frames: {export_dir} (frames={total_frames})")
+
+
+# ------------------------- Open3D visualize body + optional cloth -------------------------
+def visualize_open3d(model, betas, seconds, fps, freq_hz, device, cloth_dir=""):
+    faces = model.faces.astype(np.int32)
+
+    # initial body mesh
+    g0, p0, tr0 = walk_pose(0.0, freq_hz=freq_hz, device=device)
+    out0 = model(betas=betas, global_orient=g0, body_pose=p0, transl=tr0, return_verts=True)
+    verts0 = out0.vertices[0].detach().cpu().numpy()
+
+    body_mesh = o3d.geometry.TriangleMesh()
+    body_mesh.vertices = o3d.utility.Vector3dVector(verts0.astype(np.float64))
+    body_mesh.triangles = o3d.utility.Vector3iVector(faces)
+    body_mesh.compute_vertex_normals()
+
+    cloth_mesh = None
+    if cloth_dir and os.path.isdir(cloth_dir):
+        c0 = os.path.join(cloth_dir, "cloth_00000.obj")
+        if os.path.exists(c0):
+            cloth_mesh = o3d.io.read_triangle_mesh(c0)
+            cloth_mesh.compute_vertex_normals()
+        else:
+            print(f"[WARN] cloth_dir set but missing: {c0}")
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="SMPL-X (+cloth)", width=1200, height=900)
+    vis.add_geometry(body_mesh)
+    if cloth_mesh is not None:
+        vis.add_geometry(cloth_mesh)
+
+    ctr = vis.get_view_control()
+    ctr.set_zoom(0.7)
+
+    dt = 1.0 / fps
+    total_frames = int(seconds * fps)
+
+    for i in range(total_frames):
+        t = i * dt
+        g, p, tr = walk_pose(t, freq_hz=freq_hz, device=device)
+        out = model(betas=betas, global_orient=g, body_pose=p, transl=tr, return_verts=True)
+        verts = out.vertices[0].detach().cpu().numpy()
+
+        body_mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+        body_mesh.compute_vertex_normals()
+
+        if cloth_mesh is not None:
+            cpath = os.path.join(cloth_dir, f"cloth_{i:05d}.obj")
+            if os.path.exists(cpath):
+                new_cloth = o3d.io.read_triangle_mesh(cpath)
+                new_cloth.compute_vertex_normals()
+                cloth_mesh.vertices = new_cloth.vertices
+                cloth_mesh.triangles = new_cloth.triangles
+                cloth_mesh.vertex_normals = new_cloth.vertex_normals
+
+        vis.update_geometry(body_mesh)
+        if cloth_mesh is not None:
+            vis.update_geometry(cloth_mesh)
+
+        vis.poll_events()
+        vis.update_renderer()
+        time.sleep(dt)
+
+    vis.destroy_window()
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -452,7 +453,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--freq_hz", type=float, default=1.2)
-    ap.add_argument("--export_dir", type=str, default="", help="export body OBJs to this folder")
+
+    ap.add_argument("--export_dir", type=str, default="", help="export body OBJs to this folder (needed for cloth sim)")
 
     # cloth sim via Blender
     ap.add_argument("--cloth_obj", type=str, default="", help="cloth asset OBJ (rest pose)")
@@ -461,9 +463,9 @@ def main():
     ap.add_argument("--blender", type=str, default="", help="Blender binary path (macOS app path)")
     ap.add_argument("--blender_script", type=str, default="out/blender_cloth_sim.py", help="auto-generated bpy script path")
 
-    # rigid attachments
-    ap.add_argument("--hair_obj", type=str, default="", help="hair OBJ in head-local coordinates (optional)")
-    ap.add_argument("--export_attach", type=str, default="", help="write head transforms per frame json (optional)")
+    # NEW flags
+    ap.add_argument("--no_view_export", action="store_true", help="during export pass, do not open Open3D window (recommended)")
+    ap.add_argument("--view_cloth_only", action="store_true", help="skip export/sim and only visualize using existing --cloth_out")
 
     args = ap.parse_args()
     device = args.device
@@ -479,37 +481,38 @@ def main():
     ).to(device)
 
     betas = parse_betas(args.betas, model.num_betas, device)
-
     total_frames = int(args.seconds * args.fps)
 
-    # 1) export body sequence if requested (needed for Blender cloth sim)
-    if args.run_cloth_sim and not args.export_dir:
-        raise ValueError("--run_cloth_sim requires --export_dir to export body OBJ sequence first.")
-    if args.run_cloth_sim and not args.cloth_obj:
-        raise ValueError("--run_cloth_sim requires --cloth_obj (your clothing asset OBJ).")
-    if args.run_cloth_sim and not args.blender:
-        raise ValueError("--run_cloth_sim requires --blender (path to Blender binary).")
+    # If user only wants to view cloth results already baked
+    if args.view_cloth_only:
+        visualize_open3d(model, betas, args.seconds, args.fps, args.freq_hz, device, cloth_dir=args.cloth_out)
+        return
 
-    # Export body OBJs (and optionally attach json) by running the Open3D loop once,
-    # but you can also do "headless export" without visualizer if you want.
-    animate_walk_open3d(
-        model=model,
-        betas=betas,
-        seconds=args.seconds,
-        fps=args.fps,
-        freq_hz=args.freq_hz,
-        export_dir=args.export_dir,
-        device=device,
-        cloth_dir="",                   # cloth not yet
-        hair_obj=args.hair_obj,
-        attach_json=args.export_attach,
-    )
-
-    # 2) run Blender cloth sim (creates cloth_00000.obj ... cloth_N.obj)
+    # If cloth sim is requested, we MUST export body frames (headless recommended)
     if args.run_cloth_sim:
+        if not args.export_dir:
+            raise ValueError("--run_cloth_sim requires --export_dir to export body OBJ sequence first.")
+        if not args.cloth_obj:
+            raise ValueError("--run_cloth_sim requires --cloth_obj (your clothing asset OBJ).")
+        if not args.blender:
+            raise ValueError("--run_cloth_sim requires --blender (path to Blender binary).")
+
+        log("[1/3] Exporting body OBJ sequence (headless)...")
+        export_body_sequence(
+            model=model,
+            betas=betas,
+            seconds=args.seconds,
+            fps=args.fps,
+            freq_hz=args.freq_hz,
+            export_dir=args.export_dir,
+            device=device,
+        )
+
+        log("[2/3] Writing Blender script...")
         os.makedirs(os.path.dirname(args.blender_script), exist_ok=True) if os.path.dirname(args.blender_script) else None
         write_blender_script(args.blender_script)
 
+        log("[2/3] Running Blender cloth simulation (this can take a while)...")
         os.makedirs(args.cloth_out, exist_ok=True)
         run_blender_cloth(
             blender_bin=args.blender,
@@ -521,19 +524,18 @@ def main():
             n_frames=total_frames,
         )
 
-        # 3) visualize again with cloth
-        animate_walk_open3d(
-            model=model,
-            betas=betas,
-            seconds=args.seconds,
-            fps=args.fps,
-            freq_hz=args.freq_hz,
-            export_dir="",                # no need to re-export body
-            device=device,
-            cloth_dir=args.cloth_out,
-            hair_obj=args.hair_obj,
-            attach_json="",               # already exported if you wanted
-        )
+        # quick sanity check
+        c0 = os.path.join(args.cloth_out, "cloth_00000.obj")
+        if not os.path.exists(c0):
+            raise RuntimeError(f"Blender finished but no cloth output found: {c0}")
+
+        log("[3/3] Visualizing body + cloth in Open3D...")
+        visualize_open3d(model, betas, args.seconds, args.fps, args.freq_hz, device, cloth_dir=args.cloth_out)
+        return
+
+    # If no cloth sim requested: just view body
+    visualize_open3d(model, betas, args.seconds, args.fps, args.freq_hz, device, cloth_dir="")
+
 
 if __name__ == "__main__":
     main()
